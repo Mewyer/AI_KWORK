@@ -1,643 +1,662 @@
-import os
-import sqlite3
 import logging
-import requests
-import asyncio
-import random
-import tempfile
-import subprocess
-from datetime import datetime, timedelta
-from dotenv import load_dotenv
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    LabeledPrice
+    LabeledPrice,
+    ShippingOption
 )
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     filters,
-    ContextTypes,
-    PreCheckoutQueryHandler,
-    ConversationHandler
+    CallbackContext,
+    CallbackQueryHandler,
+    PreCheckoutQueryHandler
 )
+import urllib.parse
+import os
+import sqlite3
+from datetime import datetime, timedelta
 
-# Загрузка конфигурации
-load_dotenv()
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(",")))
-PROVIDER_TOKEN = os.getenv("PROVIDER_TOKEN")
-RUNWAY_API_KEY = os.getenv("RUNWAY_API_KEY")
-PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
-
-# Настройки подписок
-SUBSCRIPTION_PLANS = {
-    "free": {"daily_limit": 3, "monthly_limit": 20},
-    "pro": {"daily_limit": 50, "monthly_limit": 1500, "price": 1000, "duration": 30},
-    "premium": {"daily_limit": 200, "monthly_limit": 6000, "price": 3000, "duration": 30}
-}
-
-# Состояния для ConversationHandler
-SET_LIMITS, SET_PRICE = range(2)
-
-# Инициализация логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Инициализация БД
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+BASE_URL = 'https://videohunt.ai/video/hmtask0qXgeWjqV4A/moments'
+ADMIN_IDS = [] 
+DB_NAME = 'bot_database.db'
+PAYMENT_PROVIDER_TOKEN = os.getenv('PAYMENT_PROVIDER_TOKEN')
+
+
+SUBSCRIPTION_TYPES = {
+    'free': {
+        'name': 'Бесплатная',
+        'price': 0,
+        'currency': 'XTR',
+        'daily_requests': None  
+    },
+    'premium': {
+        'name': 'Премиум',
+        'price': 100,
+        'currency': 'XTR',
+        'daily_requests': None 
+    }
+}
+
 def init_db():
-    conn = sqlite3.connect('bot.db')
+    conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
         username TEXT,
-        full_name TEXT,
-        join_date TEXT,
-        subscription TEXT DEFAULT 'free',
-        expiry_date TEXT,
-        daily_used INTEGER DEFAULT 0,
-        monthly_used INTEGER DEFAULT 0,
-        last_used_date TEXT,
-        stars_balance INTEGER DEFAULT 0
-    )''')
+        first_name TEXT,
+        last_name TEXT,
+        registration_date TEXT,
+        is_admin INTEGER DEFAULT 0
+    )
+    ''')
     
     cursor.execute('''
-    CREATE TABLE IF NOT EXISTS payments (
-        payment_id TEXT PRIMARY KEY,
+    CREATE TABLE IF NOT EXISTS subscriptions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
-        amount INTEGER,
-        currency TEXT,
-        date TEXT,
-        FOREIGN KEY(user_id) REFERENCES users(user_id)
-    )''')
+        subscription_type TEXT,
+        start_date TEXT,
+        end_date TEXT,
+        FOREIGN KEY (user_id) REFERENCES users (user_id)
+    )
+    ''')
+    
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        request_date TEXT,
+        request_type TEXT,
+        FOREIGN KEY (user_id) REFERENCES users (user_id)
+    )
+    ''')
+    
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS settings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        free_daily_requests INTEGER DEFAULT 5,
+        premium_daily_requests INTEGER DEFAULT 15,
+        subscription_price INTEGER DEFAULT 100
+    )
+    ''')
+    
+    cursor.execute('SELECT COUNT(*) FROM settings')
+    if cursor.fetchone()[0] == 0:
+        cursor.execute('''
+        INSERT INTO settings (
+            free_daily_requests, 
+            premium_daily_requests, 
+            subscription_price
+        ) VALUES (?, ?, ?)
+        ''', (5, 15, 100))
+    
+    conn.commit()
+    conn.close()
+    
+    load_settings_to_subscription_types()
+
+def load_settings_to_subscription_types():
+    """Загружает настройки из базы в SUBSCRIPTION_TYPES"""
+    settings = get_settings()
+    if settings:
+        SUBSCRIPTION_TYPES['free']['daily_requests'] = settings['free_daily_requests']
+        SUBSCRIPTION_TYPES['premium']['daily_requests'] = settings['premium_daily_requests']
+
+def get_db_connection():
+    return sqlite3.connect(DB_NAME)
+
+def register_user(user_id, username, first_name, last_name):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    INSERT OR IGNORE INTO users (user_id, username, first_name, last_name, registration_date)
+    VALUES (?, ?, ?, ?, ?)
+    ''', (user_id, username, first_name, last_name, datetime.now().isoformat()))
+    
+
+    cursor.execute('SELECT COUNT(*) FROM subscriptions WHERE user_id = ?', (user_id,))
+    if cursor.fetchone()[0] == 0:
+        cursor.execute('''
+        INSERT INTO subscriptions (user_id, subscription_type, start_date, end_date)
+        VALUES (?, ?, ?, ?)
+        ''', (
+            user_id, 
+            'free', 
+            datetime.now().isoformat(), 
+            (datetime.now() + timedelta(days=365)).isoformat()
+        ))
     
     conn.commit()
     conn.close()
 
-init_db()
+def get_user_subscription(user_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    SELECT s.subscription_type, s.start_date, s.end_date
+    FROM subscriptions s
+    WHERE s.user_id = ? AND s.end_date > ?
+    ORDER BY s.end_date DESC
+    LIMIT 1
+    ''', (user_id, datetime.now().isoformat()))
+    
+    result = cursor.fetchone()
+    conn.close()
+    
+    if result:
+        subscription_type, start_date, end_date = result
+        return {
+            'type': subscription_type,
+            'name': SUBSCRIPTION_TYPES[subscription_type]['name'],
+            'start_date': datetime.fromisoformat(start_date),
+            'end_date': datetime.fromisoformat(end_date)
+        }
+    return None
 
-class Database:
-    @staticmethod
-    def get_user(user_id: int):
-        conn = sqlite3.connect('bot.db')
-        cursor = conn.cursor()
-        cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
-        user = cursor.fetchone()
+def get_today_requests_count(user_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    today = datetime.now().date().isoformat()
+    cursor.execute('''
+    SELECT COUNT(*) 
+    FROM requests 
+    WHERE user_id = ? AND date(request_date) = ?
+    ''', (user_id, today))
+    
+    count = cursor.fetchone()[0]
+    conn.close()
+    return count
+
+def log_request(user_id, request_type):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    INSERT INTO requests (user_id, request_date, request_type)
+    VALUES (?, ?, ?)
+    ''', (user_id, datetime.now().isoformat(), request_type))
+    
+    conn.commit()
+    conn.close()
+
+def get_settings():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    SELECT 
+        free_daily_requests, 
+        premium_daily_requests, 
+        subscription_price 
+    FROM settings 
+    LIMIT 1
+    ''')
+    
+    result = cursor.fetchone()
+    conn.close()
+    
+    if result:
+        return {
+            'free_daily_requests': result[0],
+            'premium_daily_requests': result[1],
+            'subscription_price': result[2]
+        }
+    return None
+
+def update_settings(free_daily=None, premium_daily=None, price=None):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    current = get_settings()
+    if not current:
         conn.close()
-        return user
-
-    @staticmethod
-    def update_user(user_id: int, **kwargs):
-        conn = sqlite3.connect('bot.db')
-        cursor = conn.cursor()
+        return False
     
-        cursor.execute('SELECT 1 FROM users WHERE user_id = ?', (user_id,))
-        exists = cursor.fetchone()
+    if free_daily is None:
+        free_daily = current['free_daily_requests']
+    if premium_daily is None:
+        premium_daily = current['premium_daily_requests']
+    if price is None:
+        price = current['subscription_price']
     
-        if not exists:
-            columns = ['user_id'] + list(kwargs.keys())
-            placeholders = ['?'] * len(columns)
-            values = [user_id] + list(kwargs.values())
-        
-            cursor.execute(f'''
-            INSERT INTO users ({", ".join(columns)})
-            VALUES ({", ".join(placeholders)})
-            ''', values)
-        else:
-            set_clause = ", ".join(f"{k} = ?" for k in kwargs)
-            values = list(kwargs.values())
-            values.append(user_id)
-            
-            cursor.execute(f'''
-            UPDATE users SET {set_clause} WHERE user_id = ?
-            ''', values)
-    
-        conn.commit()
-        conn.close()
-
-    @staticmethod
-    def add_payment(user_id: int, payment_id: str, amount: int, currency: str):
-        conn = sqlite3.connect('bot.db')
-        cursor = conn.cursor()
-        
+    try:
         cursor.execute('''
-        INSERT INTO payments (payment_id, user_id, amount, currency, date)
-        VALUES (?, ?, ?, ?, ?)
-        ''', (payment_id, user_id, amount, currency, datetime.now().strftime("%Y-%m-%d")))
+        UPDATE settings
+        SET 
+            free_daily_requests = ?,
+            premium_daily_requests = ?,
+            subscription_price = ?
+        ''', (free_daily, premium_daily, price))
         
         conn.commit()
-        conn.close()
-
-    @staticmethod
-    def get_all_users():
-        conn = sqlite3.connect('bot.db')
-        cursor = conn.cursor()
-        cursor.execute('SELECT user_id, username, subscription, expiry_date FROM users')
-        users = cursor.fetchall()
-        conn.close()
-        return users
-
-    @staticmethod
-    def get_payment_stats():
-        conn = sqlite3.connect('bot.db')
-        cursor = conn.cursor()
-        cursor.execute('''
-        SELECT COUNT(*), SUM(amount) FROM payments 
-        WHERE date >= date('now', '-30 days')
-        ''')
-        stats = cursor.fetchone()
-        conn.close()
-        return stats
-
-class SubscriptionManager:
-    @staticmethod
-    def check_limits(user_id: int):
-        user = Database.get_user(user_id)
-        if not user:
-            return False
-            
-        today = datetime.now().strftime("%Y-%m-%d")
-        sub_plan = SUBSCRIPTION_PLANS.get(user[4], SUBSCRIPTION_PLANS['free'])
-        
-        if user[8] != today:
-            Database.update_user(user_id, daily_used=0, last_used_date=today)
-            user = (user[0], user[1], user[2], user[3], user[4], user[5], 0, user[7], today, user[9])
-        
-        if (user[6] >= sub_plan['daily_limit'] or 
-            user[7] >= sub_plan['monthly_limit']):
-            return False
-            
         return True
+    except Exception as e:
+        logger.error(f"Ошибка при обновлении настроек: {str(e)}")
+        return False
+    finally:
+        conn.close()
 
-    @staticmethod
-    def increment_usage(user_id: int):
-        Database.update_user(
-            user_id,
-            daily_used=sqlite3.connect('bot.db').execute(
-                'SELECT daily_used + 1 FROM users WHERE user_id = ?', 
-                (user_id,)
-            ).fetchone()[0],
-            monthly_used=sqlite3.connect('bot.db').execute(
-                'SELECT monthly_used + 1 FROM users WHERE user_id = ?', 
-                (user_id,)
-            ).fetchone()[0]
-        )
+def get_bot_stats():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT COUNT(*) FROM users')
+    total_users = cursor.fetchone()[0]
+    
+    cursor.execute('''
+    SELECT COUNT(DISTINCT user_id) 
+    FROM subscriptions 
+    WHERE subscription_type = 'premium' AND end_date > ?
+    ''', (datetime.now().isoformat(),))
+    premium_users = cursor.fetchone()[0]
+    
+    cursor.execute('SELECT COUNT(*) FROM requests')
+    total_requests = cursor.fetchone()[0]
+    
+    conn.close()
+    
+    return {
+        'total_users': total_users,
+        'premium_users': premium_users,
+        'total_requests': total_requests
+    }
 
-class VideoTools:
-    @staticmethod
-    async def download_video(video_url: str, output_path: str):
-        """Скачивание видео по URL"""
-        try:
-            response = requests.get(video_url, stream=True, timeout=30)
-            response.raise_for_status()
-            
-            with open(output_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            return True
-        except Exception as e:
-            logger.error(f"Video download failed: {str(e)}")
-            return False
-
-    @staticmethod
-    async def generate_video_from_text(prompt: str):
-        """Генерация видео из текста"""
-        if not prompt or len(prompt.strip()) < 5:
-            logger.error("Prompt is too short or empty")
-            return None
-
-        url = "https://api.runwayml.com/v1/text-to-video/generate"
-        headers = {
-            "Authorization": f"Bearer {RUNWAY_API_KEY}",
-            "Content-Type": "application/json",
-            "Accept": "application/json"
-        }
-        
-        data = {
-            "text_prompt": prompt[:200],
-            "seed": random.randint(0, 10000),
-            "cfg_scale": 7.5,
-            "motion_bucket_id": 40,
-            "width": 512,
-            "height": 512,
-            "fps": 12,
-            "duration_seconds": 4
-        }
-
-        try:
-            response = requests.post(url, headers=headers, json=data, timeout=15)
-            response.raise_for_status()
-            result = response.json()
-            return result.get("output_url")
-        except Exception as e:
-            logger.error(f"Video generation failed: {str(e)}")
-            return None
-
-    @staticmethod
-    async def search_videos(query: str):
-        """Поиск видео"""
-        if not query or len(query.strip()) < 2:
-            return []
-
-        url = "https://api.pexels.com/videos/search"
-        headers = {"Authorization": PEXELS_API_KEY}
-        params = {
-            "query": query,
-            "per_page": 3,
-            "size": "small",
-            "orientation": "landscape"
-        }
-
-        try:
-            response = requests.get(url, headers=headers, params=params, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            
-            videos = []
-            for video in data.get("videos", [])[:3]:
-                if video.get("video_files"):
-                    best_file = min(
-                        (f for f in video["video_files"] if f.get("quality") == "sd"),
-                        key=lambda x: x.get("width", 0)
-                    )
-                    videos.append(best_file["link"])
-            return videos
-        except Exception as e:
-            logger.error(f"Video search failed: {str(e)}")
-            return []
-
-# Основные команды бота
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update: Update, context: CallbackContext) -> None:
+    """Отправляет приветственное сообщение"""
     user = update.effective_user
-    if not Database.get_user(user.id):
-        Database.update_user(
-            user.id,
-            username=user.username,
-            full_name=user.full_name,
-            join_date=datetime.now().strftime("%Y-%m-%d"),
-            subscription="free"
-        )
+    register_user(user.id, user.username, user.first_name, user.last_name)
+    
+    settings = get_settings()
+    subscription = get_user_subscription(user.id)
     
     text = (
-        f"👋 Привет, {user.first_name}!\n\n"
-        "🎥 Я - продвинутый видео-бот с функциями:\n"
-        "• Генерация видео из текста /generate\n"
-        "• Поиск видео /search\n"
-        "• Автомонтаж /edit\n"
-        "• Подписки /subscription"
+        f"Привет, {user.first_name}! Я бот для анализа видео\n\n"
+        f"Ваша подписка: {subscription['name']}\n"
+        f"Лимиты:\n"
+        f"- Запросов в день: {settings['free_daily_requests'] if subscription['type'] == 'free' else settings['premium_daily_requests']}\n"
+        "Доступные команды:\n"
+        "/video [ссылка] [промт] - Анализ видео\n"
+        "/buy - Купить подписку\n"
+        "/info - Информация о боте"
     )
     
     if user.id in ADMIN_IDS:
-        text += "\n\n🛠 Доступно: /admin - Панель управления"
+        text += "\n\nАдмин-команды:\n/admin - Панель администратора"
     
     await update.message.reply_text(text)
 
-async def show_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user = Database.get_user(user_id)
+async def video_command(update: Update, context: CallbackContext) -> None:
+    """Обрабатывает команду /video [ссылка] [промт]"""
+    user = update.effective_user
+    register_user(user.id, user.username, user.first_name, user.last_name)
     
-    if not user:
-        Database.update_user(
-            user_id,
-            username=update.effective_user.username,
-            full_name=update.effective_user.full_name,
-            join_date=datetime.now().strftime("%Y-%m-%d"),
-            subscription="free"
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text(
+            "Используйте команду в формате:\n"
+            "/video [ссылка на YouTube] [промт]\n\n"
+            "Пример:\n"
+            "/video https://www.youtube.com/watch?v=dQw4w9WgXcQ Найди интересные моменты"
         )
-        user = Database.get_user(user_id)
-        if not user:
-            await update.message.reply_text("❌ Ошибка при создании вашего профиля.")
-            return
+        return
     
-    sub_plan = SUBSCRIPTION_PLANS.get(user[4], SUBSCRIPTION_PLANS['free'])
-    expiry = f"\n🔚 Истекает: {user[5]}" if user[5] else ""
+    video_url = context.args[0]
+    prompt = ' '.join(context.args[1:])
+    
+    subscription = get_user_subscription(user.id)
+    settings = get_settings()
+    daily_requests = get_today_requests_count(user.id)
+    
+    max_requests = settings['free_daily_requests'] if subscription['type'] == 'free' else settings['premium_daily_requests']
+    
+    if daily_requests >= max_requests:
+        await update.message.reply_text(
+            f"❌ Вы исчерпали дневной лимит запросов ({max_requests}).\n"
+            "Используйте /buy для покупки подписки."
+        )
+        return
+    
+    if not is_valid_url(video_url):
+        await update.message.reply_text("❌ Некорректная ссылка на видео. Пожалуйста, укажите валидную ссылку YouTube.")
+        return
+    
+    clean_url = clean_video_url(video_url)
+    if 'youtube.com' not in clean_url and 'youtu.be' not in clean_url:
+        await update.message.reply_text("❌ Пожалуйста, укажите ссылку именно на YouTube видео.")
+        return
+    
+    result_url = f"{BASE_URL}?url={urllib.parse.quote(clean_url)}&query={urllib.parse.quote(prompt)}"
+    
+    log_request(user.id, 'video_analysis')
+    
+    await send_results(update, result_url)
+
+async def send_results(update: Update, result_url: str):
+    """Отправляет результаты пользователю"""
+    try:
+        keyboard = [[InlineKeyboardButton("🔗 Открыть результаты", url=result_url)]]
+        await update.message.reply_text(
+            "Ссылка с результатами анализа готова!",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при отправке результатов: {str(e)}")
+        await update.message.reply_text(f"Вот ваша ссылка с результатами:\n{result_url}")
+
+async def buy_subscription(update: Update, context: CallbackContext):
+    """Показывает информацию о покупке подписки"""
+    user = update.effective_user
+    settings = get_settings()
+    
+    price = settings['subscription_price']
+
+    title = "Премиум подписка"
+    description = (
+        f"Доступно {settings['premium_daily_requests']} запросов в день\n"
+        "Без ограничений на количество запросов"
+    )
+    payload = f"subscription_{user.id}"
+    currency = "XTR"
+    prices = [LabeledPrice("Премиум подписка", price)]
+    
+    await context.bot.send_invoice(
+        chat_id=user.id,
+        title=title,
+        description=description,
+        payload=payload,
+        provider_token=PAYMENT_PROVIDER_TOKEN,
+        currency=currency,
+        prices=prices,
+        start_parameter="premium_subscription",
+        need_name=False,
+        need_phone_number=False,
+        need_email=False,
+        need_shipping_address=False,
+        is_flexible=False
+    )
+
+async def precheckout_callback(update: Update, context: CallbackContext):
+    """Обрабатывает предварительный запрос на оплату"""
+    query = update.pre_checkout_query
+    await query.answer(ok=True)
+
+async def successful_payment_callback(update: Update, context: CallbackContext):
+    """Обрабатывает успешную оплату"""
+    user = update.effective_user
+    payment = update.message.successful_payment
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    end_date = datetime.now() + timedelta(days=30)
+    cursor.execute('''
+    INSERT INTO subscriptions (user_id, subscription_type, start_date, end_date)
+    VALUES (?, ?, ?, ?)
+    ''', (user.id, 'premium', datetime.now().isoformat(), end_date.isoformat()))
+    
+    conn.commit()
+    conn.close()
+    
+    settings = get_settings()
+    
+    await update.message.reply_text(
+        f"✅ Оплата прошла успешно! Вы получили премиум подписку.\n"
+        f"Теперь у вас {settings['premium_daily_requests']} запросов в день.\n"
+        f"Подписка активна до {end_date.strftime('%d.%m.%Y')}"
+    )
+
+async def handle_message(update: Update, context: CallbackContext) -> None:
+    """Обрабатывает сообщения пользователя"""
+    user = update.effective_user
+    text = update.message.text.strip()
+    
+    if context.user_data.get('awaiting_video_url'):
+        if is_valid_url(text):
+            clean_url = clean_video_url(text)
+            if 'youtube.com' in clean_url or 'youtu.be' in clean_url:
+                context.user_data['video_url'] = clean_url
+                context.user_data['awaiting_video_url'] = False
+                context.user_data['awaiting_prompt'] = True
+                await update.message.reply_text("✅ Ссылка принята. Теперь отправьте промт для анализа:")
+            else:
+                await update.message.reply_text("❌ Пожалуйста, отправьте ссылку на YouTube.")
+        else:
+            await update.message.reply_text("❌ Некорректная ссылка. Попробуйте еще раз.")
+    
+    elif context.user_data.get('awaiting_prompt'):
+        prompt = text
+        video_url = context.user_data['video_url']
+        
+        result_url = f"{BASE_URL}?url={urllib.parse.quote(video_url)}&query={urllib.parse.quote(prompt)}"
+        
+        log_request(user.id, 'video_analysis')
+        
+        del context.user_data['video_url']
+        del context.user_data['awaiting_prompt']
+        
+        await send_results(update, result_url)
+
+async def admin_panel(update: Update, context: CallbackContext):
+    """Показывает панель администратора"""
+    user = update.effective_user
+    
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ У вас нет доступа к этой команде.")
+        return
     
     text = (
-        f"📌 Ваша подписка: {user[4].upper()}{expiry}\n"
-        f"📊 Использовано: {user[6]}/{sub_plan['daily_limit']} (день), "
-        f"{user[7]}/{sub_plan['monthly_limit']} (месяц)\n"
-        f"🌟 Stars: {user[9]}"
+        "Админ-панель:\n\n"
+        "Доступные команды:\n"
+        "/stats - Статистика бота\n"
+        "/set_free_requests - Изменить лимит запросов для бесплатной подписки\n"
+        "/set_premium_requests - Изменить лимит запросов для премиум подписки\n"
+        "/set_price - Изменить цену подписки\n"
+        "/broadcast - Сделать рассылку\n"
     )
     
-    keyboard = []
-    if user[4] == 'free':
-        keyboard.append([InlineKeyboardButton("💎 Оформить PRO", callback_data="upgrade_pro")])
-        keyboard.append([InlineKeyboardButton("🚀 Оформить PREMIUM", callback_data="upgrade_premium")])
-    else:
-        keyboard.append([InlineKeyboardButton("🔄 Продлить подписку", callback_data=f"upgrade_{user[4]}")])
-    
-    keyboard.append([InlineKeyboardButton("⭐ Купить Stars", callback_data="buy_stars")])
-    
-    await update.message.reply_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(keyboard)
-)
+    await update.message.reply_text(text)
 
-async def generate_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+async def admin_stats(update: Update, context: CallbackContext):
+    """Показывает статистику бота"""
+    user = update.effective_user
     
-    if not SubscriptionManager.check_limits(user_id):
-        await update.message.reply_text("❌ Лимит запросов исчерпан! Используйте /subscription")
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ У вас нет доступа к этой команде.")
+        return
+    
+    stats = get_bot_stats()
+    settings = get_settings()
+    
+    text = (
+        "📊 Статистика бота:\n\n"
+        f"Количество пользователей: {stats['total_users']}\n"
+        f"Пользователей с активной подпиской: {stats['premium_users']}\n"
+        f"Всего запросов: {stats['total_requests']}\n\n"
+        "Текущие настройки:\n"
+        f"- Цена подписки: {settings['subscription_price'] / 100:.2f} {SUBSCRIPTION_TYPES['premium']['currency']}\n"
+        f"- Запросов/день (без подписки): {settings['free_daily_requests']}\n"
+        f"- Запросов/день (с подпиской): {settings['premium_daily_requests']}\n"
+    )
+    
+    await update.message.reply_text(text)
+
+async def set_free_requests(update: Update, context: CallbackContext):
+    """Установка лимита запросов для бесплатной подписки"""
+    user = update.effective_user
+    
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ У вас нет доступа к этой команде.")
         return
     
     if not context.args:
-        await update.message.reply_text("ℹ️ Использование: /generate [описание видео]")
-        return
-    
-    await update.message.reply_text("🔄 Генерирую видео...")
-    
-    if video_url := await VideoTools.generate_video_from_text(" ".join(context.args)):
-        SubscriptionManager.increment_usage(user_id)
-        await update.message.reply_video(video=video_url)
-    else:
-        await update.message.reply_text("❌ Ошибка генерации видео")
-
-async def search_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    
-    if not SubscriptionManager.check_limits(user_id):
-        await update.message.reply_text("❌ Лимит запросов исчерпан! Используйте /subscription")
-        return
-    
-    if not context.args:
-        await update.message.reply_text("ℹ️ Использование: /search [запрос]")
-        return
-    
-    await update.message.reply_text("🔍 Ищу видео...")
-    
-    if videos := await VideoTools.search_videos(" ".join(context.args)):
-        SubscriptionManager.increment_usage(user_id)
-        for video_url in videos[:3]:
-            await update.message.reply_video(video=video_url)
-    else:
-        await update.message.reply_text("❌ Видео не найдены")
-
-async def edit_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    
-    if not SubscriptionManager.check_limits(user_id):
-        await update.message.reply_text("❌ Лимит запросов исчерпан! Используйте /subscription")
-        return
-    
-    if not update.message.video and not update.message.document:
-        await update.message.reply_text(
-            "ℹ️ Отправьте видео файлом с подписью /edit [промт]\n\n"
-            "Примеры промтов:\n"
-            "• \"Обрежь первые 10 секунд\"\n"
-            "• \"Добавить фильтр noir\"\n"
-            "• \"Ускорить в 1.5x\""
-        )
+        await update.message.reply_text("Используйте: /set_free_requests <количество>")
         return
     
     try:
-        msg = await update.message.reply_text("🔄 Начинаю обработку видео...")
+        value = int(context.args[0])
+        if value < 1:
+            raise ValueError("Количество запросов должно быть не менее 1")
         
-        # Получаем видео
-        video_file = await context.bot.get_file(update.message.video or update.message.document)
-        temp_input = f"input_{user_id}.mp4"
-        await video_file.download_to_drive(temp_input)
+        if update_settings(free_daily=value):
+            SUBSCRIPTION_TYPES['free']['daily_requests'] = value
+            response = f"✅ Лимит запросов/день (без подписки) изменен на {value}"
+        else:
+            raise ValueError("Ошибка при обновлении базы данных")
         
-        # Создаем временный выходной файл
-        temp_output = f"output_{user_id}.mp4"
+        await update.message.reply_text(response)
+    
+    except ValueError as e:
+        error_msg = f"❌ Ошибка: {str(e)}\nПожалуйста, введите корректное число."
+        await update.message.reply_text(error_msg)
+
+async def set_premium_requests(update: Update, context: CallbackContext):
+    """Установка лимита запросов для премиум подписки"""
+    user = update.effective_user
+    
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ У вас нет доступа к этой команде.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Используйте: /set_premium_requests <количество>")
+        return
+    
+    try:
+        value = int(context.args[0])
+        if value < 1:
+            raise ValueError("Количество запросов должно быть не менее 1")
         
-        # Простая обработка с помощью ffmpeg (пример)
-        command = [
-            'ffmpeg',
-            '-i', temp_input,
-            '-vf', 'scale=640:-1',  # Изменение размера
-            '-c:a', 'copy',
-            '-y', temp_output
-        ]
-        subprocess.run(command, check=True)
+        if update_settings(premium_daily=value):
+            SUBSCRIPTION_TYPES['premium']['daily_requests'] = value
+            response = f"✅ Лимит запросов/день (с подпиской) изменен на {value}"
+        else:
+            raise ValueError("Ошибка при обновлении базы данных")
         
-        # Отправляем результат
-        with open(temp_output, 'rb') as result_file:
-            await update.message.reply_video(
-                video=result_file,
-                caption="✅ Видео обработано",
-                supports_streaming=True
+        await update.message.reply_text(response)
+    
+    except ValueError as e:
+        error_msg = f"❌ Ошибка: {str(e)}\nПожалуйста, введите корректное число."
+        await update.message.reply_text(error_msg)
+
+async def set_price(update: Update, context: CallbackContext):
+    """Установка цены подписки"""
+    user = update.effective_user
+    
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ У вас нет доступа к этой команде.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text(f"Используйте: /set_price <цена в {SUBSCRIPTION_TYPES['premium']['currency']}>")
+        return
+    
+    try:
+        value = int(float(context.args[0]) * 100)
+        if value <= 0:
+            raise ValueError("Цена должна быть больше 0")
+        
+        if update_settings(price=value):
+            SUBSCRIPTION_TYPES['premium']['price'] = value
+            response = f"✅ Цена подписки изменена на {value / 100:.2f} {SUBSCRIPTION_TYPES['premium']['currency']}"
+        else:
+            raise ValueError("Ошибка при обновлении базы данных")
+        
+        await update.message.reply_text(response)
+    
+    except ValueError as e:
+        error_msg = f"❌ Ошибка: {str(e)}\nПожалуйста, введите корректное число."
+        await update.message.reply_text(error_msg)
+
+async def broadcast(update: Update, context: CallbackContext):
+    """Рассылка сообщения всем пользователям"""
+    user = update.effective_user
+    
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ У вас нет доступа к этой команде.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Используйте: /broadcast <сообщение>")
+        return
+    
+    message = ' '.join(context.args)
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT user_id FROM users')
+    users = cursor.fetchall()
+    conn.close()
+    
+    success = 0
+    failed = 0
+    
+    for (user_id,) in users:
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"📢 Сообщение от администратора:\n\n{message}"
             )
-        
-        await msg.delete()
-        SubscriptionManager.increment_usage(user_id)
-        
-    except Exception as e:
-        logger.error(f"Editing failed: {str(e)}")
-        await update.message.reply_text("❌ Ошибка при обработке видео")
-    finally:
-        # Удаляем временные файлы
-        for f in [temp_input, temp_output]:
-            if os.path.exists(f):
-                try:
-                    os.remove(f)
-                except:
-                    pass
-
-# Платежи и подписки
-async def upgrade_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    sub_type = query.data.split('_')[1]
-    plan = SUBSCRIPTION_PLANS.get(sub_type)
-    
-    if not plan:
-        await query.answer("Неизвестный тип подписки")
-        return
-    
-    await query.bot.send_invoice(
-        chat_id=query.message.chat_id,
-        title=f"{sub_type.upper()} подписка",
-        description=f"Доступ на {plan['duration']} дней",
-        payload=f"sub_{sub_type}",
-        provider_token=PROVIDER_TOKEN,
-        currency="USD",
-        prices=[LabeledPrice(f"{sub_type.upper()} подписка", plan['price'] * 100)]
-    )
-
-async def buy_stars_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    keyboard = [
-        [InlineKeyboardButton("⭐ 100 Stars ($1)", callback_data="stars_100")],
-        [InlineKeyboardButton("🌟 500 Stars ($5)", callback_data="stars_500")],
-        [InlineKeyboardButton("💫 1000 Stars ($10)", callback_data="stars_1000")]
-    ]
-    
-    await query.edit_message_text(
-        "Выберите количество Stars для покупки:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-)
-
-async def process_stars_purchase(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    amount = int(query.data.split('_')[1])
-    
-    await query.bot.send_invoice(
-        chat_id=query.message.chat_id,
-        title=f"Покупка {amount} Stars",
-        description="Пополнение баланса Telegram Stars",
-        payload=f"stars_{amount}",
-        provider_token=PROVIDER_TOKEN,
-        currency="USD",
-        prices=[LabeledPrice(f"{amount} Stars", amount * 100)]
-    )
-
-async def precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.pre_checkout_query
-    if query.invoice_payload.startswith(('sub_', 'stars_')):
-        await query.answer(ok=True)
-    else:
-        await query.answer(ok=False, error_message="Ошибка платежа")
-
-async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    payment = update.message.successful_payment
-    user_id = update.effective_user.id
-    
-    Database.add_payment(
-        user_id,
-        payment.invoice_payload,
-        payment.total_amount // 100,
-        payment.currency
-    )
-    
-    if payment.invoice_payload.startswith('sub_'):
-        sub_type = payment.invoice_payload.split('_')[1]
-        expiry = (datetime.now() + timedelta(days=SUBSCRIPTION_PLANS[sub_type]['duration'])).strftime("%Y-%m-%d")
-        Database.update_user(user_id, subscription=sub_type, expiry_date=expiry)
-        await update.message.reply_text(f"✅ {sub_type.upper()} подписка активирована до {expiry}!")
-    elif payment.invoice_payload.startswith('stars_'):
-        amount = int(payment.invoice_payload.split('_')[1])
-        Database.update_user(user_id, stars_balance=sqlite3.connect('bot.db').execute(
-            'SELECT stars_balance + ? FROM users WHERE user_id = ?', 
-            (amount, user_id)
-        ).fetchone()[0])
-        await update.message.reply_text(f"✅ Ваш баланс пополнен на {amount} Stars!")
-
-# Админ-панель
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Доступ запрещен")
-        return
-    
-    keyboard = [
-        [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
-        [InlineKeyboardButton("👥 Пользователи", callback_data="admin_users")],
-        [InlineKeyboardButton("⚙️ Настройки подписок", callback_data="admin_subscription_settings")]
-    ]
+            success += 1
+        except Exception as e:
+            logger.error(f"Ошибка при отправке сообщения пользователю {user_id}: {str(e)}")
+            failed += 1
     
     await update.message.reply_text(
-        "🛠 Админ-панель",
-        reply_markup=InlineKeyboardMarkup(keyboard))
-
-async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    total_users = len(Database.get_all_users())
-    payments_count, payments_sum = Database.get_payment_stats()
-    
-    await query.edit_message_text(
-        f"📊 Статистика:\n\n"
-        f"👥 Всего пользователей: {total_users}\n"
-        f"💳 Платежи (30 дней): {payments_count} на сумму ${payments_sum or 0}"
+        f"✅ Рассылка завершена:\n"
+        f"Успешно отправлено: {success}\n"
+        f"Не удалось отправить: {failed}"
     )
+            
+def is_valid_url(url: str) -> bool:
+    """Проверяет валидность URL"""
+    parsed = urllib.parse.urlparse(url)
+    return all([parsed.scheme, parsed.netloc])
 
-async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    users = Database.get_all_users()
-    text = "👥 Последние пользователи:\n\n" + "\n".join(
-        f"{user[0]}: @{user[1]} ({user[2]})" 
-        for user in users[-10:]
-    )
-    await query.edit_message_text(text)
+def clean_video_url(url: str) -> str:
+    """Очищает URL видео от ненужных параметров"""
+    if 'youtube.com' in url or 'youtu.be' in url:
+        return url.split('&')[0]
+    return url
 
-async def admin_subscription_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    keyboard = [
-        [InlineKeyboardButton("🆓 Free", callback_data="set_free")],
-        [InlineKeyboardButton("💎 PRO", callback_data="set_pro")],
-        [InlineKeyboardButton("🚀 PREMIUM", callback_data="set_premium")],
-        [InlineKeyboardButton("🔙 Назад", callback_data="back_to_admin")]
-    ]
-    
-    await query.edit_message_text(
-        "Выберите тип подписки для настройки:",
-        reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def set_limits_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    sub_type = query.data.split('_')[1]
-    context.user_data['sub_type'] = sub_type
+def main() -> None:
+    """Запуск бота"""
+    init_db()
     
-    await query.edit_message_text(
-        f"Введите дневной и месячный лимиты для {sub_type.upper()} через пробел (например: 5 100):"
-    )
-    return SET_LIMITS
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-async def set_limits(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        daily, monthly = map(int, update.message.text.split())
-        sub_type = context.user_data['sub_type']
-        SUBSCRIPTION_PLANS[sub_type]['daily_limit'] = daily
-        SUBSCRIPTION_PLANS[sub_type]['monthly_limit'] = monthly
-        
-        await update.message.reply_text(
-            f"✅ Лимиты для {sub_type.upper()} обновлены: {daily}/день, {monthly}/месяц"
-        )
-    except ValueError:
-        await update.message.reply_text("❌ Неверный формат. Попробуйте снова.")
-        return SET_LIMITS
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("video", video_command))
+    application.add_handler(CommandHandler("buy", buy_subscription))
+    application.add_handler(CommandHandler("admin", admin_panel))
     
-    return ConversationHandler.END
+    application.add_handler(CommandHandler("stats", admin_stats))
+    application.add_handler(CommandHandler("set_free_requests", set_free_requests))
+    application.add_handler(CommandHandler("set_premium_requests", set_premium_requests))
+    application.add_handler(CommandHandler("set_price", set_price))
+    application.add_handler(CommandHandler("broadcast", broadcast))
+    
+    application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+    application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
+    
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-async def back_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await admin_panel(update, context)
+    application.run_polling()
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Отменено")
-    return ConversationHandler.END
-
-def main():
-    app = Application.builder().token(TOKEN).build()
-    
-    # Основные команды
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("subscription", show_subscription))
-    app.add_handler(CommandHandler("generate", generate_video))
-    app.add_handler(CommandHandler("search", search_videos))
-    app.add_handler(CommandHandler("edit", edit_video))
-    app.add_handler(CommandHandler("admin", admin_panel))
-    
-    # Обработчики кнопок
-    app.add_handler(CallbackQueryHandler(upgrade_subscription, pattern="^upgrade_"))
-    app.add_handler(CallbackQueryHandler(buy_stars_menu, pattern="^buy_stars$"))
-    app.add_handler(CallbackQueryHandler(process_stars_purchase, pattern="^stars_"))
-    app.add_handler(CallbackQueryHandler(admin_stats, pattern="^admin_stats$"))
-    app.add_handler(CallbackQueryHandler(admin_users, pattern="^admin_users$"))
-    app.add_handler(CallbackQueryHandler(admin_subscription_settings, pattern="^admin_subscription_settings$"))
-    app.add_handler(CallbackQueryHandler(back_to_admin, pattern="^back_to_admin$"))
-    
-    # Платежи
-    app.add_handler(PreCheckoutQueryHandler(precheckout))
-    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
-    
-    # Настройка подписок
-    sub_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(set_limits_start, pattern="^set_")],
-        states={
-            SET_LIMITS: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_limits)]
-        },
-        fallbacks=[CommandHandler("cancel", cancel)]
-    )
-    app.add_handler(sub_conv)
-    
-    # Запуск бота
-    app.run_polling()
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
