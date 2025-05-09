@@ -22,8 +22,8 @@ Telegram бот для анализа видео с YouTube. Позволяет 
 
 1. Клонируйте репозиторий:
 ```bash
-git clone <ваш-репозиторий>
-cd <папка-проекта>
+git https://github.com/Mewyer/AI_KWORK
+cd AI_KWORK
 ```
 
 2. установка зависимостей
