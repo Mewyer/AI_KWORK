@@ -293,7 +293,6 @@ async def start(update: Update, context: CallbackContext) -> None:
         "Доступные команды:\n"
         "/video [ссылка] [промт] - Анализ видео\n"
         "/buy - Купить подписку\n"
-        "/info - Информация о боте"
     )
     
     if user.id in ADMIN_IDS:
