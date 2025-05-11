@@ -1,10 +1,17 @@
 import logging
+import sqlite3
+import asyncio
+import urllib.parse
+import os
+import subprocess
+import tempfile
+from datetime import datetime, timedelta
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LabeledPrice,
-    ShippingOption
+    InputFile
 )
 from telegram.ext import (
     Application,
@@ -12,26 +19,22 @@ from telegram.ext import (
     MessageHandler,
     filters,
     CallbackContext,
-    CallbackQueryHandler,
     PreCheckoutQueryHandler
 )
-import urllib.parse
-import os
-import sqlite3
-from datetime import datetime, timedelta
 
+# Настройки логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-BASE_URL = 'https://videohunt.ai/video/hmtask0qXgeWjqV4A/moments'
-ADMIN_IDS = [] 
+# Конфигурация
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', "7945876963:AAHloZ4PxwmoqlDCS6DLuyu8Se-bK5KHnqg")
+ADMIN_IDS = [6107527766] 
 DB_NAME = 'bot_database.db'
 PAYMENT_PROVIDER_TOKEN = os.getenv('PAYMENT_PROVIDER_TOKEN')
-
+NEW_SCRIPT_PATH = 'new.py'  # Путь к скрипту new.py
 
 SUBSCRIPTION_TYPES = {
     'free': {
@@ -301,21 +304,9 @@ async def start(update: Update, context: CallbackContext) -> None:
     await update.message.reply_text(text)
 
 async def video_command(update: Update, context: CallbackContext) -> None:
-    """Обрабатывает команду /video [ссылка] [промт]"""
+    """Обрабатывает команду /video с пошаговым вводом"""
     user = update.effective_user
     register_user(user.id, user.username, user.first_name, user.last_name)
-    
-    if not context.args or len(context.args) < 2:
-        await update.message.reply_text(
-            "Используйте команду в формате:\n"
-            "/video [ссылка на YouTube] [промт]\n\n"
-            "Пример:\n"
-            "/video https://www.youtube.com/watch?v=dQw4w9WgXcQ Найди интересные моменты"
-        )
-        return
-    
-    video_url = context.args[0]
-    prompt = ' '.join(context.args[1:])
     
     subscription = get_user_subscription(user.id)
     settings = get_settings()
@@ -330,20 +321,11 @@ async def video_command(update: Update, context: CallbackContext) -> None:
         )
         return
     
-    if not is_valid_url(video_url):
-        await update.message.reply_text("❌ Некорректная ссылка на видео. Пожалуйста, укажите валидную ссылку YouTube.")
-        return
-    
-    clean_url = clean_video_url(video_url)
-    if 'youtube.com' not in clean_url and 'youtu.be' not in clean_url:
-        await update.message.reply_text("❌ Пожалуйста, укажите ссылку именно на YouTube видео.")
-        return
-    
-    result_url = f"{BASE_URL}?url={urllib.parse.quote(clean_url)}&query={urllib.parse.quote(prompt)}"
-    
-    log_request(user.id, 'video_analysis')
-    
-    await send_results(update, result_url)
+    context.user_data['awaiting_video_url'] = True
+    await update.message.reply_text(
+        "Отправьте ссылку на YouTube видео для анализа:"
+    )
+
 
 async def send_results(update: Update, result_url: str):
     """Отправляет результаты пользователю"""
@@ -419,6 +401,77 @@ async def successful_payment_callback(update: Update, context: CallbackContext):
         f"Подписка активна до {end_date.strftime('%d.%m.%Y')}"
     )
 
+async def process_video_async(update: Update, context: CallbackContext, video_url: str, prompt: str):
+    """Асинхронная обработка видео"""
+    try:
+        # Создаем временные файлы
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_file:
+            screenshot_path = tmp_file.name
+        
+        # Запускаем new.py в отдельном процессе
+        process = await asyncio.create_subprocess_exec(
+            'python', 
+            NEW_SCRIPT_PATH, 
+            video_url, 
+            prompt,
+            screenshot_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        # Ждем завершения процесса
+        stdout, stderr = await process.communicate()
+        
+        if process.returncode != 0:
+            logger.error(f"Ошибка выполнения new.py: {stderr.decode()}")
+            await update.message.reply_text("❌ Произошла ошибка при обработке видео")
+            return
+        
+        # Отправляем основной скриншот
+        if os.path.exists(screenshot_path):
+            with open(screenshot_path, 'rb') as photo:
+                await update.message.reply_photo(
+                    photo=InputFile(photo),
+                    caption="Результат анализа видео"
+                )
+        else:
+            await update.message.reply_text("⚠️ Не удалось создать основной скриншот")
+        
+        # Отправляем скриншоты элементов
+        screenshots_dir = os.path.join(os.path.dirname(screenshot_path), "screenshots")
+        if os.path.exists(screenshots_dir):
+            screenshots = [f for f in os.listdir(screenshots_dir) if f.endswith('.png')]
+            if not screenshots:
+                await update.message.reply_text("⚠️ Не найдены скриншоты элементов")
+            else:
+                for screenshot_file in sorted(screenshots):
+                    file_path = os.path.join(screenshots_dir, screenshot_file)
+                    try:
+                        with open(file_path, 'rb') as photo:
+                            await update.message.reply_photo(
+                                photo=InputFile(photo),
+                                caption=f"Фрагмент {screenshot_file.replace('.png', '')}"
+                            )
+                    except Exception as e:
+                        logger.error(f"Ошибка отправки {file_path}: {str(e)}")
+        
+        log_request(user.id, 'video_analysis')
+        
+    except Exception as e:
+        logger.error(f"Ошибка при обработке видео: {str(e)}")
+        await update.message.reply_text("❌ Произошла ошибка при обработке видео")
+    finally:
+        # Удаляем временные файлы
+        if os.path.exists(screenshot_path):
+            os.remove(screenshot_path)
+        
+        screenshots_dir = os.path.join(os.path.dirname(screenshot_path), "screenshots")
+        if os.path.exists(screenshots_dir):
+            for screenshot_file in os.listdir(screenshots_dir):
+                if screenshot_file.endswith('.png'):
+                    os.remove(os.path.join(screenshots_dir, screenshot_file))
+            os.rmdir(screenshots_dir)
+
 async def handle_message(update: Update, context: CallbackContext) -> None:
     """Обрабатывает сообщения пользователя"""
     user = update.effective_user
@@ -441,14 +494,21 @@ async def handle_message(update: Update, context: CallbackContext) -> None:
         prompt = text
         video_url = context.user_data['video_url']
         
-        result_url = f"{BASE_URL}?url={urllib.parse.quote(video_url)}&query={urllib.parse.quote(prompt)}"
+        await update.message.reply_text("🔄 Начинаю обработку видео. Вы можете продолжать использовать другие команды...")
         
-        log_request(user.id, 'video_analysis')
+        # Запускаем обработку видео в фоне
+        asyncio.create_task(process_video_async(update, context, video_url, prompt))
         
-        del context.user_data['video_url']
-        del context.user_data['awaiting_prompt']
+        # Очищаем контекст
+        if 'video_url' in context.user_data:
+            del context.user_data['video_url']
+        if 'awaiting_prompt' in context.user_data:
+            del context.user_data['awaiting_prompt']
+    
+    # Обработка других команд и сообщений
+    elif text.startswith('/'):
+        await update.message.reply_text("Пожалуйста, используйте команды через меню или дождитесь завершения текущей задачи.")
         
-        await send_results(update, result_url)
 
 async def admin_panel(update: Update, context: CallbackContext):
     """Показывает панель администратора"""
