@@ -30,8 +30,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Конфигурация
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', "7945876963:AAHloZ4PxwmoqlDCS6DLuyu8Se-bK5KHnqg")
-ADMIN_IDS = [6107527766] 
+TELEGRAM_TOKEN = os.getenv()
+ADMIN_IDS = [] 
 DB_NAME = 'bot_database.db'
 PAYMENT_PROVIDER_TOKEN = os.getenv('PAYMENT_PROVIDER_TOKEN')
 NEW_SCRIPT_PATH = 'new.py'  # Путь к скрипту new.py
