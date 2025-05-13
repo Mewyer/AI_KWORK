@@ -323,7 +323,7 @@ async def video_command(update: Update, context: CallbackContext) -> None:
     
     context.user_data['awaiting_video_url'] = True
     await update.message.reply_text(
-        "Отправьте ссылку на YouTube видео для анализа:"
+        "Отправьте ссылку на YouTube видео:"
     )
 
 
@@ -332,7 +332,7 @@ async def send_results(update: Update, result_url: str):
     try:
         keyboard = [[InlineKeyboardButton("🔗 Открыть результаты", url=result_url)]]
         await update.message.reply_text(
-            "Ссылка с результатами анализа готова!",
+            "Ссылка с результатами готова!",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
     except Exception as e:
@@ -484,7 +484,7 @@ async def handle_message(update: Update, context: CallbackContext) -> None:
                 context.user_data['video_url'] = clean_url
                 context.user_data['awaiting_video_url'] = False
                 context.user_data['awaiting_prompt'] = True
-                await update.message.reply_text("✅ Ссылка принята. Теперь отправьте промт для анализа:")
+                await update.message.reply_text("✅ Ссылка принята. Теперь отправьте промт:")
             else:
                 await update.message.reply_text("❌ Пожалуйста, отправьте ссылку на YouTube.")
         else:
